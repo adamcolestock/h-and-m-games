@@ -63,6 +63,8 @@
 "use strict";
 
 const LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const EXPRESSIONS = ["happy", "mad", "surprised", "sad", "sleepy", "silly", "shy"];
+const randomExpr = () => EXPRESSIONS[Math.floor(Math.random() * EXPRESSIONS.length)];
 const canvas = document.getElementById("c");
 const ctx = canvas.getContext("2d");
 const dpr = Math.min(2, window.devicePixelRatio || 1);
@@ -95,13 +97,17 @@ function hueFor() {
 }
 
 function save() {
-  try { localStorage.setItem("fingies-v1", JSON.stringify(fingies.map(({c0,r0,cols,rows,letter,hue}) => ({c0,r0,cols,rows,letter,hue})))); } catch (e) {}
+  try { localStorage.setItem("fingies-v1", JSON.stringify(fingies.map(({c0,r0,cols,rows,letter,hue,expr}) => ({c0,r0,cols,rows,letter,hue,expr})))); } catch (e) {}
 }
 function load() {
   try {
     const d = JSON.parse(localStorage.getItem("fingies-v1"));
     if (Array.isArray(d)) for (const f of d)
-      if (LETTERS.includes(f.letter)) fingies.push({ id: nextId++, ...f });
+      if (LETTERS.includes(f.letter)) {
+        if (!EXPRESSIONS.includes(f.expr)) f.expr = randomExpr();
+        if (f.letter === "M") f.expr = "happy";
+        fingies.push({ id: nextId++, ...f });
+      }
   } catch (e) {}
 }
 
@@ -211,32 +217,105 @@ function drawFingie(f) {
   ctx.strokeStyle = `hsl(${f.hue}, 50%, 45%)`;
   ctx.stroke();
 
-  // fingernail
-  const nw = w * 0.44, nh = Math.min(h * 0.3, nw * 1.1);
-  if (nh > 5) {
-    const nx = x + (w - nw) / 2, ny = y + Math.min(10, h * 0.08);
-    const nr = Math.min(nw, nh) * 0.45;
-    ctx.beginPath();
-    ctx.moveTo(nx + nr, ny);
-    ctx.arcTo(nx + nw, ny, nx + nw, ny + nh, nr);
-    ctx.arcTo(nx + nw, ny + nh, nx, ny + nh, nr);
-    ctx.arcTo(nx, ny + nh, nx, ny, nr);
-    ctx.arcTo(nx, ny, nx + nw, ny, nr);
-    ctx.closePath();
-    ctx.fillStyle = `hsl(${f.hue}, 55%, 89%)`;
-    ctx.fill();
-    ctx.strokeStyle = `hsl(${f.hue}, 40%, 65%)`;
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
-  }
+  // face (every fingie gets one; returns the face's bottom edge)
+  const faceTop = y + Math.max(4, Math.min(26, h * 0.18));
+  const faceBottom = drawFace(f, x, y, w, h, faceTop, live);
 
-  // letter
-  const fs = Math.max(11, Math.min(w * 0.5, h * 0.4, 36));
+  // letter lives in its own strip below the face — never overlapping it
+  const strip = y + h - faceBottom;
+  const fs = Math.max(7, Math.min(w * 0.5, strip * 0.75, 36));
   ctx.font = `bold ${fs}px 'Trebuchet MS', sans-serif`;
   ctx.textAlign = "center"; ctx.textBaseline = "middle";
   ctx.fillStyle = `hsl(${f.hue}, 55%, 30%)`;
-  ctx.fillText(f.letter, x + w / 2, y + Math.max(h * 0.62, nh + fs * 0.7 + 4));
+  ctx.fillText(f.letter, x + w / 2, faceBottom + strip / 2);
   ctx.restore();
+}
+
+// tiny face: resting expression, or a singing face while the note sounds
+function drawFace(f, x, y, w, h, faceTop, live) {
+  // feature unit scales down with the fingie so every fingie gets a face
+  const u = Math.max(1.1, Math.min(w * 0.11, (y + h - faceTop) * 0.07, 5));
+  const ink = `hsl(${f.hue}, 55%, 24%)`;
+  const cx = x + w / 2;
+  const eyeY = faceTop + u * 2;
+  const mouthY = eyeY + u * 2.8;
+  const dx = Math.min(Math.max(u * 1.7, w * 0.17), w / 2 - u * 1.7);  // eye offset from center
+  ctx.lineWidth = Math.max(1, u * 0.45);
+  ctx.lineCap = "round";
+  ctx.strokeStyle = ink;
+  ctx.fillStyle = ink;
+
+  const dotEye = ex => { ctx.beginPath(); ctx.arc(ex, eyeY, u * 0.85, 0, 7); ctx.fill(); };
+  const closedEye = (ex, up) => {  // up=true: happy ∪-arc, false: sleepy ∩-arc
+    ctx.beginPath();
+    if (up) ctx.arc(ex, eyeY + u * 0.6, u * 1.1, Math.PI * 1.15, Math.PI * 1.85);
+    else    ctx.arc(ex, eyeY - u * 0.6, u * 1.1, Math.PI * 0.15, Math.PI * 0.85);
+    ctx.stroke();
+  };
+  const smile = () => { ctx.beginPath(); ctx.arc(cx, mouthY - u * 0.6, u * 1.7, Math.PI * 0.15, Math.PI * 0.85); ctx.stroke(); };
+  const frown = () => { ctx.beginPath(); ctx.arc(cx, mouthY + u * 1.6, u * 1.7, Math.PI * 1.15, Math.PI * 1.85); ctx.stroke(); };
+
+  if (live) {  // singing! happy closed eyes + big open mouth
+    closedEye(cx - dx, true); closedEye(cx + dx, true);
+    ctx.beginPath(); ctx.ellipse(cx, mouthY + u * 0.4, u * 1.5, u * 2, 0, 0, 7); ctx.fill();
+    ctx.fillStyle = "#e8798a";
+    ctx.beginPath(); ctx.ellipse(cx, mouthY + u * 1.3, u * 0.9, u * 0.8, 0, 0, 7); ctx.fill();
+    return mouthY + u * 2.6;
+  }
+
+  switch (f.letter === "M" ? "happy" : f.expr) {   // M is always happy
+    case "happy":
+      dotEye(cx - dx); dotEye(cx + dx);
+      // big open-mouth smile: a filled half-circle, flat side up
+      ctx.beginPath();
+      ctx.arc(cx, mouthY - u * 0.4, u * 1.7, 0, Math.PI);
+      ctx.closePath();
+      ctx.fill();
+      break;
+    case "mad":
+      dotEye(cx - dx); dotEye(cx + dx);
+      ctx.beginPath();
+      ctx.moveTo(cx - dx - u * 1.2, eyeY - u * 2.4); ctx.lineTo(cx - dx + u * 0.8, eyeY - u * 1.3);
+      ctx.moveTo(cx + dx + u * 1.2, eyeY - u * 2.4); ctx.lineTo(cx + dx - u * 0.8, eyeY - u * 1.3);
+      ctx.stroke();
+      frown();
+      break;
+    case "surprised":
+      for (const ex of [cx - dx, cx + dx]) {
+        ctx.fillStyle = "#fff";
+        ctx.beginPath(); ctx.arc(ex, eyeY, u * 1.5, 0, 7); ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = ink;
+        ctx.beginPath(); ctx.arc(ex, eyeY, u * 0.6, 0, 7); ctx.fill();
+      }
+      ctx.beginPath(); ctx.arc(cx, mouthY + u * 0.4, u * 1.1, 0, 7); ctx.fill();
+      break;
+    case "sad":
+      dotEye(cx - dx); dotEye(cx + dx); frown();
+      ctx.fillStyle = "#7fb8e8";  // a little tear
+      ctx.beginPath(); ctx.ellipse(cx + dx + u * 0.9, eyeY + u * 1.7, u * 0.55, u * 0.85, 0, 0, 7); ctx.fill();
+      break;
+    case "sleepy":
+      closedEye(cx - dx, false); closedEye(cx + dx, false);
+      ctx.beginPath(); ctx.ellipse(cx, mouthY + u * 0.3, u * 0.7, u * 0.55, 0, 0, 7); ctx.stroke();
+      break;
+    case "silly":
+      dotEye(cx - dx); closedEye(cx + dx, true);  // wink
+      smile();
+      ctx.fillStyle = "#e8798a";                  // tongue
+      ctx.beginPath(); ctx.ellipse(cx + u * 0.6, mouthY + u * 1.5, u * 0.8, u * 1.1, 0, 0, 7); ctx.fill();
+      break;
+    case "shy":
+      dotEye(cx - dx); dotEye(cx + dx);
+      ctx.beginPath(); ctx.arc(cx, mouthY - u * 0.2, u, Math.PI * 0.2, Math.PI * 0.8); ctx.stroke();
+      ctx.fillStyle = "rgba(240, 130, 150, 0.45)";  // blush
+      ctx.beginPath();
+      ctx.ellipse(cx - dx - u * 0.5, eyeY + u * 1.8, u * 1.1, u * 0.7, 0, 0, 7);
+      ctx.ellipse(cx + dx + u * 0.5, eyeY + u * 1.8, u * 1.1, u * 0.7, 0, 0, 7);
+      ctx.fill();
+      break;
+  }
+  return mouthY + u * 2.6;
 }
 
 function draw() {
@@ -320,7 +399,8 @@ function endPointer(e) {
     if (e.type === "pointerup") {
       const letter = nextLetter();
       if (!letter) { toast("Out of letters — all 26 fingies drawn!"); return; }
-      const f = { id: nextId++, c0, r0, cols: c1 - c0 + 1, rows: r1 - r0 + 1, letter, hue: hueFor() };
+      const f = { id: nextId++, c0, r0, cols: c1 - c0 + 1, rows: r1 - r0 + 1, letter, hue: hueFor(),
+                  expr: letter === "M" ? "happy" : randomExpr() };
       fingies.push(f);
       save(); updateCount();
       noteOn(f); setTimeout(() => noteOff(f.id), 350);   // little "hello" note
@@ -367,10 +447,29 @@ eraserBtn.addEventListener("click", () => {
   eraserBtn.classList.toggle("on", eraseMode);
   canvas.style.cursor = eraseMode ? "not-allowed" : "crosshair";
 });
-document.getElementById("clear").addEventListener("click", () => {
-  if (fingies.length && !confirm("Wipe all fingies off the grid?")) return;
-  for (const f of fingies) noteOff(f.id);
+// tap once to arm, tap again to wipe (no confirm() — it's blocked in some embedded browsers)
+const clearBtn = document.getElementById("clear");
+let clearArmed = 0;
+function disarmClear() {
+  clearArmed = 0;
+  clearBtn.textContent = "🗑 clear";
+  clearBtn.classList.remove("on");
+}
+clearBtn.addEventListener("click", () => {
+  if (!fingies.length) return;
+  if (Date.now() > clearArmed) {
+    clearArmed = Date.now() + 2500;
+    clearBtn.textContent = "🗑 tap again!";
+    clearBtn.classList.add("on");
+    setTimeout(() => { if (clearArmed && Date.now() >= clearArmed) disarmClear(); }, 2600);
+    return;
+  }
+  for (const id of [...voices.keys()]) noteOff(id);
+  playingPointers.clear();
+  heldKeys.clear();
+  marquee = null;
   fingies = [];
+  disarmClear();
   save(); updateCount();
 });
 
