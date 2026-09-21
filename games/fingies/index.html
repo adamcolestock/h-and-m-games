@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Fingies</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>✋</text></svg>">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    font-family: "Trebuchet MS", "Comic Sans MS", system-ui, sans-serif;
+    background: #fbfaf4;
+    display: flex; flex-direction: column;
+    -webkit-user-select: none; user-select: none;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 12px;
+    background: #fffdf2;
+    border-bottom: 3px solid #e3ddc8;
+    flex-wrap: wrap;
+  }
+  header .back {
+    text-decoration: none; font-size: 18px; font-weight: bold;
+    color: #8a7d5f; padding: 4px 10px;
+    border: 2px solid #e3ddc8; border-radius: 10px;
+  }
+  header h1 { font-size: 22px; color: #4a6fa5; }
+  header .hint { font-size: 13px; color: #9a917a; flex: 1; min-width: 120px; }
+  header #count { font-size: 13px; color: #9a917a; }
+  header button {
+    font-family: inherit; font-size: 15px; font-weight: bold;
+    color: #5a5140; background: #f2eede;
+    border: 2px solid #d8d0b4; border-radius: 10px;
+    padding: 6px 14px; cursor: pointer;
+  }
+  header button.on { background: #f4a9a8; border-color: #c96f6e; color: #6b2a29; }
+  canvas { flex: 1; touch-action: none; cursor: crosshair; display: block; }
+  #toast {
+    position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+    background: rgba(60,50,35,.9); color: #fff;
+    font-size: 15px; padding: 10px 20px; border-radius: 12px;
+    opacity: 0; transition: opacity .25s; pointer-events: none;
+  }
+  #toast.show { opacity: 1; }
+  @media (max-width: 640px) { header .hint { display: none; } }
+</style>
+</head>
+<body>
+  <header>
+    <a class="back" href="../../" title="back to the arcade">←</a>
+    <h1>✋ Fingies</h1>
+    <span class="hint">drag on the grid to draw a fingie · hold its letter key, or press &amp; hold it, to play</span>
+    <span id="count"></span>
+    <button id="eraser">🧽 erase</button>
+    <button id="clear">🗑 clear</button>
+  </header>
+  <canvas id="c"></canvas>
+  <div id="toast"></div>
+
+<script>
+"use strict";
+
+const LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+const dpr = Math.min(2, window.devicePixelRatio || 1);
+
+let W = 0, H = 0, CELL = 28;
+function resize() {
+  W = canvas.clientWidth; H = canvas.clientHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  CELL = Math.max(16, Math.min(40, Math.floor(Math.min(W / 24, H / 16))));
+}
+addEventListener("resize", () => { resize(); });
+
+// ---------- state ----------
+let fingies = [];          // {id, c0, r0, cols, rows, letter, hue}
+let nextId = 1;
+let marquee = null;        // {c0, r0, c1, r1, pointerId}
+let eraseMode = false;
+const playingPointers = new Map();  // pointerId -> fingie id
+const heldKeys = new Set();
+
+function usedLetters() { return new Set(fingies.map(f => f.letter)); }
+function nextLetter() {
+  const used = usedLetters();
+  for (const L of LETTERS) if (!used.has(L)) return L;
+  return null;
+}
+function hueFor() {
+  const used = fingies.length;
+  return (used * 137.5 + 10) % 360;
+}
+
+function save() {
+  try { localStorage.setItem("fingies-v1", JSON.stringify(fingies.map(({c0,r0,cols,rows,letter,hue}) => ({c0,r0,cols,rows,letter,hue})))); } catch (e) {}
+}
+function load() {
+  try {
+    const d = JSON.parse(localStorage.getItem("fingies-v1"));
+    if (Array.isArray(d)) for (const f of d)
+      if (LETTERS.includes(f.letter)) fingies.push({ id: nextId++, ...f });
+  } catch (e) {}
+}
+
+function toast(msg) {
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(toast.tid);
+  toast.tid = setTimeout(() => t.classList.remove("show"), 1800);
+}
+
+function updateCount() {
+  document.getElementById("count").textContent = `${fingies.length} / 26 fingies`;
+}
+
+// ---------- sound ----------
+let AC = null;
+function audio() {
+  if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+  if (AC && AC.state === "suspended") AC.resume();
+  return AC;
+}
+
+// bigger fingie -> deeper note, snapped to C-major pentatonic (always harmonious)
+const SCALE = [];
+for (const base of [48, 60, 72]) for (const d of [0, 2, 4, 7, 9]) SCALE.push(base + d);
+function midiFor(f) {
+  const area = f.cols * f.rows;
+  const fromTop = Math.round(Math.log2(area) * 1.8);
+  return SCALE[Math.max(0, Math.min(SCALE.length - 1, SCALE.length - 1 - fromTop))];
+}
+
+const voices = new Map();  // fingie id -> {osc, lfo, gain, count}
+function noteOn(f) {
+  if (!audio()) return;
+  let v = voices.get(f.id);
+  if (v) { v.count++; return; }
+  const t = AC.currentTime;
+  const freq = 440 * Math.pow(2, (midiFor(f) - 69) / 12);
+  const gain = AC.createGain();
+  gain.gain.setValueAtTime(0.0001, t);
+  gain.gain.exponentialRampToValueAtTime(0.17, t + 0.03);
+  const filt = AC.createBiquadFilter();
+  filt.type = "lowpass"; filt.frequency.value = freq * 5; filt.Q.value = 0.7;
+  const osc = AC.createOscillator();
+  osc.type = "triangle"; osc.frequency.value = freq;
+  const lfo = AC.createOscillator(); lfo.frequency.value = 5.2;
+  const lg = AC.createGain();
+  lg.gain.setValueAtTime(0, t);
+  lg.gain.linearRampToValueAtTime(freq * 0.007, t + 0.4);
+  lfo.connect(lg); lg.connect(osc.frequency);
+  osc.connect(filt); filt.connect(gain); gain.connect(AC.destination);
+  osc.start(t); lfo.start(t);
+  voices.set(f.id, { osc, lfo, gain, count: 1 });
+}
+function noteOff(id) {
+  const v = voices.get(id);
+  if (!v) return;
+  if (--v.count > 0) return;
+  const t = AC.currentTime;
+  v.gain.gain.cancelScheduledValues(t);
+  v.gain.gain.setValueAtTime(Math.max(0.0001, v.gain.gain.value), t);
+  v.gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
+  v.osc.stop(t + 0.22); v.lfo.stop(t + 0.22);
+  voices.delete(id);
+}
+function isPlaying(id) { return voices.has(id); }
+
+// ---------- geometry ----------
+function rectOf(f) { return { x: f.c0 * CELL, y: f.r0 * CELL, w: f.cols * CELL, h: f.rows * CELL }; }
+function fingieAt(px, py) {
+  for (let i = fingies.length - 1; i >= 0; i--) {
+    const { x, y, w, h } = rectOf(fingies[i]);
+    if (px >= x && px <= x + w && py >= y && py <= y + h) return fingies[i];
+  }
+  return null;
+}
+
+// ---------- drawing ----------
+let T = 0;
+function fingiePath(x, y, w, h) {
+  const r = Math.min(w / 2, h);
+  ctx.beginPath();
+  ctx.moveTo(x, y + h);
+  ctx.lineTo(x, y + r);
+  ctx.arcTo(x, y, x + r, y, r);
+  ctx.lineTo(x + w - r, y);
+  ctx.arcTo(x + w, y, x + w, y + r, r);
+  ctx.lineTo(x + w, y + h);
+  ctx.closePath();
+}
+
+function drawFingie(f) {
+  const { x, y, w, h } = rectOf(f);
+  const live = isPlaying(f.id);
+  ctx.save();
+  if (live) {  // squishy wiggle while sounding
+    const s = 1 + 0.03 * Math.sin(T * 18 + f.id);
+    ctx.translate(x + w / 2, y + h);
+    ctx.scale(2 - s, s);
+    ctx.translate(-(x + w / 2), -(y + h));
+  }
+  fingiePath(x, y, w, h);
+  ctx.fillStyle = `hsl(${f.hue}, ${live ? 85 : 62}%, ${live ? 66 : 76}%)`;
+  ctx.fill();
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = `hsl(${f.hue}, 50%, 45%)`;
+  ctx.stroke();
+
+  // fingernail
+  const nw = w * 0.44, nh = Math.min(h * 0.3, nw * 1.1);
+  if (nh > 5) {
+    const nx = x + (w - nw) / 2, ny = y + Math.min(10, h * 0.08);
+    const nr = Math.min(nw, nh) * 0.45;
+    ctx.beginPath();
+    ctx.moveTo(nx + nr, ny);
+    ctx.arcTo(nx + nw, ny, nx + nw, ny + nh, nr);
+    ctx.arcTo(nx + nw, ny + nh, nx, ny + nh, nr);
+    ctx.arcTo(nx, ny + nh, nx, ny, nr);
+    ctx.arcTo(nx, ny, nx + nw, ny, nr);
+    ctx.closePath();
+    ctx.fillStyle = `hsl(${f.hue}, 55%, 89%)`;
+    ctx.fill();
+    ctx.strokeStyle = `hsl(${f.hue}, 40%, 65%)`;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+
+  // letter
+  const fs = Math.max(11, Math.min(w * 0.5, h * 0.4, 36));
+  ctx.font = `bold ${fs}px 'Trebuchet MS', sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = `hsl(${f.hue}, 55%, 30%)`;
+  ctx.fillText(f.letter, x + w / 2, y + Math.max(h * 0.62, nh + fs * 0.7 + 4));
+  ctx.restore();
+}
+
+function draw() {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  // graph-paper grid
+  ctx.strokeStyle = "rgba(90, 140, 200, 0.18)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x = 0; x <= W; x += CELL) { ctx.moveTo(x + 0.5, 0); ctx.lineTo(x + 0.5, H); }
+  for (let y = 0; y <= H; y += CELL) { ctx.moveTo(0, y + 0.5); ctx.lineTo(W, y + 0.5); }
+  ctx.stroke();
+
+  for (const f of fingies) drawFingie(f);
+
+  if (marquee) {
+    const c0 = Math.min(marquee.c0, marquee.c1), c1 = Math.max(marquee.c0, marquee.c1);
+    const r0 = Math.min(marquee.r0, marquee.r1), r1 = Math.max(marquee.r0, marquee.r1);
+    const x = c0 * CELL, y = r0 * CELL, w = (c1 - c0 + 1) * CELL, h = (r1 - r0 + 1) * CELL;
+    fingiePath(x, y, w, h);
+    const hue = hueFor();
+    ctx.fillStyle = `hsla(${hue}, 70%, 75%, 0.45)`;
+    ctx.fill();
+    ctx.setLineDash([7, 5]);
+    ctx.strokeStyle = `hsl(${hue}, 55%, 50%)`;
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+
+function frame(now) {
+  T = now / 1000;
+  draw();
+  requestAnimationFrame(frame);
+}
+
+// ---------- input: pointers (mouse + touch, multi-touch chords) ----------
+function cellFromEvent(e) {
+  const r = canvas.getBoundingClientRect();
+  const px = e.clientX - r.left, py = e.clientY - r.top;
+  return {
+    px, py,
+    c: Math.max(0, Math.min(Math.floor(W / CELL) - 1, Math.floor(px / CELL))),
+    r: Math.max(0, Math.min(Math.floor(H / CELL) - 1, Math.floor(py / CELL))),
+  };
+}
+
+canvas.addEventListener("pointerdown", e => {
+  e.preventDefault();
+  audio();
+  try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+  const { px, py, c, r } = cellFromEvent(e);
+  const hit = fingieAt(px, py);
+  if (hit) {
+    if (eraseMode) { removeFingie(hit); return; }
+    playingPointers.set(e.pointerId, hit.id);
+    noteOn(hit);
+    return;
+  }
+  if (eraseMode || marquee) return;      // one marquee at a time
+  marquee = { c0: c, r0: r, c1: c, r1: r, pointerId: e.pointerId };
+});
+
+canvas.addEventListener("pointermove", e => {
+  if (marquee && e.pointerId === marquee.pointerId) {
+    const { c, r } = cellFromEvent(e);
+    marquee.c1 = c; marquee.r1 = r;
+  }
+});
+
+function endPointer(e) {
+  if (playingPointers.has(e.pointerId)) {
+    noteOff(playingPointers.get(e.pointerId));
+    playingPointers.delete(e.pointerId);
+  }
+  if (marquee && e.pointerId === marquee.pointerId) {
+    const c0 = Math.min(marquee.c0, marquee.c1), c1 = Math.max(marquee.c0, marquee.c1);
+    const r0 = Math.min(marquee.r0, marquee.r1), r1 = Math.max(marquee.r0, marquee.r1);
+    marquee = null;
+    if (e.type === "pointerup") {
+      const letter = nextLetter();
+      if (!letter) { toast("Out of letters — all 26 fingies drawn!"); return; }
+      const f = { id: nextId++, c0, r0, cols: c1 - c0 + 1, rows: r1 - r0 + 1, letter, hue: hueFor() };
+      fingies.push(f);
+      save(); updateCount();
+      noteOn(f); setTimeout(() => noteOff(f.id), 350);   // little "hello" note
+    }
+  }
+}
+canvas.addEventListener("pointerup", endPointer);
+canvas.addEventListener("pointercancel", endPointer);
+canvas.addEventListener("contextmenu", e => e.preventDefault());
+
+function removeFingie(f) {
+  noteOff(f.id);
+  fingies = fingies.filter(g => g.id !== f.id);
+  save(); updateCount();
+}
+
+// ---------- input: keyboard ----------
+addEventListener("keydown", e => {
+  if (e.repeat || e.metaKey || e.ctrlKey || e.altKey) return;
+  const L = e.key.toUpperCase();
+  if (!LETTERS.includes(L) || heldKeys.has(L)) return;
+  const f = fingies.find(g => g.letter === L);
+  if (!f) return;
+  heldKeys.add(L);
+  audio();
+  noteOn(f);
+});
+addEventListener("keyup", e => {
+  const L = e.key.toUpperCase();
+  if (!heldKeys.has(L)) return;
+  heldKeys.delete(L);
+  const f = fingies.find(g => g.letter === L);
+  if (f) noteOff(f.id);
+});
+addEventListener("blur", () => {           // stop stuck notes if window loses focus
+  for (const L of heldKeys) { const f = fingies.find(g => g.letter === L); if (f) noteOff(f.id); }
+  heldKeys.clear();
+});
+
+// ---------- toolbar ----------
+const eraserBtn = document.getElementById("eraser");
+eraserBtn.addEventListener("click", () => {
+  eraseMode = !eraseMode;
+  eraserBtn.classList.toggle("on", eraseMode);
+  canvas.style.cursor = eraseMode ? "not-allowed" : "crosshair";
+});
+document.getElementById("clear").addEventListener("click", () => {
+  if (fingies.length && !confirm("Wipe all fingies off the grid?")) return;
+  for (const f of fingies) noteOff(f.id);
+  fingies = [];
+  save(); updateCount();
+});
+
+// ---------- go ----------
+load();
+resize();
+updateCount();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
